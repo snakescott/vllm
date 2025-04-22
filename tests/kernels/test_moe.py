@@ -13,7 +13,7 @@ from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 import vllm.model_executor.layers.fused_moe  # noqa
 from tests.kernels.utils import (opcheck, stack_and_dev, torch_moe,
                                  torch_moe_single)
-from vllm.model_executor.layers.fused_moe import fused_moe
+from vllm.model_executor.layers.fused_moe import fused_moe, fused_experts_triton_exp
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.moe_torch_iterative import (
     fused_moe as iterative_moe)
@@ -97,6 +97,65 @@ def test_fused_moe(
                                torch_output,
                                atol=2e-2,
                                rtol=0)
+
+
+@pytest.mark.parametrize("m", [1, 33, 64, 222, 1024 * 128])
+@pytest.mark.parametrize("n", [128, 1024, 2048])
+@pytest.mark.parametrize("k", [128, 511, 1024])
+@pytest.mark.parametrize("e", NUM_EXPERTS)
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("ep_size", EP_SIZE)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fused_moe_new(
+    m: int,
+    n: int,
+    k: int,
+    e: int,
+    topk: int,
+    ep_size: int,
+    dtype: torch.dtype,
+):
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
+
+    score = torch.randn((m, e), device="cuda", dtype=dtype)
+
+    if ep_size > 1:
+        local_e = e // ep_size
+        e_ids = torch.randint(0,
+                              e, (local_e, ),
+                              device="cuda",
+                              dtype=torch.int32)
+        e_map = torch.full((e, ), -1, device="cuda", dtype=torch.int32)
+        e_map[e_ids] = torch.arange(local_e, device="cuda", dtype=torch.int32)
+        w1 = w1[e_ids]
+        w2 = w2[e_ids]
+    else:
+        e_map = None
+
+    torch_output = torch_moe(a, w1, w2, score, topk, e_map)
+    # Skip iterative output for now since it is already covered above
+    # iterative_output = iterative_moe(a,
+    #                                  w1,
+    #                                  w2,
+    #                                  score,
+    #                                  topk,
+    #                                  global_num_experts=e,
+    #                                  expert_map=e_map,
+    #                                  renormalize=False)
+
+
+    triton_output = fused_experts_triton_exp(a,
+                              w1,
+                              w2,
+                              score,
+                              topk)
+    torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
+    # torch.testing.assert_close(iterative_output,
+    #                            torch_output,
+    #                            atol=2e-2,
+    #                            rtol=0)
 
 
 @pytest.mark.parametrize("m", [1, 32, 222])

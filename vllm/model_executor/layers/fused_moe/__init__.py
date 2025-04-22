@@ -39,7 +39,7 @@ if HAS_TRITON:
         cutlass_moe_fp8)
     from vllm.model_executor.layers.fused_moe.fused_moe import (
         fused_experts, fused_moe, fused_topk, get_config_file_name,
-        grouped_topk)
+        grouped_topk, fused_experts_triton_exp)
 
     __all__ += [
         "fused_moe",
@@ -48,4 +48,5 @@ if HAS_TRITON:
         "get_config_file_name",
         "grouped_topk",
         "cutlass_moe_fp8",
-    ]
+        "fused_experts_triton_exp",
+        ]

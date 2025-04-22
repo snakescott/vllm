@@ -8,6 +8,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from triton_bench.routing import routing
+from triton_bench.matmul_ogs import matmul_ogs
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
@@ -1025,7 +1027,6 @@ direct_register_custom_op(
     tags=(torch.Tag.needs_fixed_stride_order, ),
 )
 
-
 def outplace_fused_experts(
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
@@ -1048,13 +1049,14 @@ def outplace_fused_experts(
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
         block_shape: Optional[List[int]] = None) -> torch.Tensor:
+
     return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids,
-                              False, activation, apply_router_weight_on_input,
-                              use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16,
-                              use_int4_w4a16, per_channel_quant,
-                              global_num_experts, expert_map, w1_scale,
-                              w2_scale, w1_zp, w2_zp, a1_scale, a2_scale,
-                              block_shape)
+                            False, activation, apply_router_weight_on_input,
+                            use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16,
+                            use_int4_w4a16, per_channel_quant,
+                            global_num_experts, expert_map, w1_scale,
+                            w2_scale, w1_zp, w2_zp, a1_scale, a2_scale,
+                            block_shape)
 
 
 def outplace_fused_experts_fake(
@@ -1172,6 +1174,78 @@ def fused_experts(hidden_states: torch.Tensor,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_shape)
+
+
+# This is a new triton implementation of the fused_experts function
+# Note: this only supports outplace and automatically renormalizes
+# TODO: add support for more arguments (see fused_experts)
+# TODO: integrate with fused_moe outer function
+# TODO: check whether chunking is needed  (see fused_experts_impl)
+def fused_experts_triton_exp(hidden_states: torch.Tensor,
+                            w1: torch.Tensor,
+                            w2: torch.Tensor,
+                            router_logits: torch.Tensor,
+                            topk: int,
+                            activation: str = "silu") -> torch.Tensor:
+
+    # quantization not yet supported in new triton MoE kernel
+    assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
+    assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
+    assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+
+    # Shape check
+    assert hidden_states.ndim == 2, "hidden_states must be 2D"
+    assert hidden_states.shape[-1] == w1.shape[
+        -1], "hidden_states shape[-1] must be equal to w1 shape[-1]"
+    assert w1.shape[-1] == w2.shape[
+        1], "w1 shape[-1] must be equal to w2 shape[1]"
+
+
+
+    M, K = hidden_states.shape
+    N = w1.shape[1]
+
+    # compute new Triton style routing inputs
+    routing_data, gather_idx, scatter_idx = routing(router_logits, topk)
+
+    n_expts_tot = routing_data.n_expts_tot
+    n_expts_act = routing_data.n_expts_act
+
+    w1 = w1.transpose(-2, -1).contiguous()
+    w2 = w2.transpose(-2, -1).contiguous()
+
+    # consistent with default implementation
+    intermediate_cache2 = torch.empty((M * n_expts_act, N // 2),
+                                      device="cuda",
+                                      dtype=torch.bfloat16)
+    out_hidden_states = torch.empty_like(hidden_states)
+
+    intermediate_cache1 = matmul_ogs(hidden_states, w1, None, routing_data,
+                                     gather_indx)
+
+    # TODO: replace vllm impls here with triton impls -- 
+    # note that triton code is not a drop in replacement hence haven't do this yet.
+    if activation == "silu":
+        torch.ops._C.silu_and_mul(intermediate_cache2,
+                                  intermediate_cache1.view(-1, N))
+    elif activation == "gelu":
+        torch.ops._C.gelu_and_mul(intermediate_cache2,
+                                  intermediate_cache1.view(-1, N))
+    else:
+        raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+
+    intermediate_cache3 = matmul_ogs(intermediate_cache2, w2, None,
+                                     routing_data, None)
+    wintermediate_cache3 = intermediate_cache3 * routing_data.gate_scal[:,
+                                                                        None]
+
+    wintermediate_cache3 = wintermediate_cache3[scatter_indx.src_indx].reshape(
+        M, -1, K)
+
+    ops.moe_sum(wintermediate_cache3.view(*wintermediate_cache3.shape),
+                out_hidden_states)
+
+    return out_hidden_states
 
 
 def moe_kernel_prepare_input(
